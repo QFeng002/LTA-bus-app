@@ -1,0 +1,6 @@
+{
+  "name": "SG Live Bus Arrivals",
+  "description": "Live bus arrival timings for Singapore bus stops, featuring real-time LTA DataMall updates every 20 seconds.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
