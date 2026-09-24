@@ -1,64 +1,84 @@
 /**
- * Health check API handler
- * Vercel serverless function and Express route handler
- *
- * Reports whether the key is configured (keyConfigured) and whether LTA
- * answered, including the upstream HTTP status code.
- * Never prints the key or any part of it.
+ * Serverless function for checking LTA service health and credential configuration.
+ * Compatible with Vercel Serverless Functions and Express.
+ * Never exposes or logs the credential or any part of it.
  */
-export default async function handler(req, res) {
-  const accountKey = process.env.LTA_ACCOUNT_KEY;
 
-  // BEFORE the fetch, if that variable is missing or empty, return 503
-  // and do not call LTA at all; never let an unset variable reach the header.
-  if (!accountKey || !accountKey.trim()) {
-    return res.status(503).json({
+export default async function handler(req, res) {
+  if (res.setHeader) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  }
+
+  if (req.method === 'OPTIONS') {
+    if (typeof res.status === 'function') {
+      return res.status(204).end();
+    }
+    res.statusCode = 204;
+    return res.end();
+  }
+
+  const apiKey = process.env.LTA_ACCOUNT_KEY;
+
+  // 1. If key is missing or empty, do not call LTA at all
+  if (!apiKey || apiKey.trim() === '') {
+    const payload = {
       keyConfigured: false,
       ltaAnswered: false,
       upstreamStatus: null,
-      upstreamStatusCode: null,
-      error: 'LTA_ACCOUNT_KEY is not set. Add it in Vercel and redeploy.',
-    });
+      error: 'LTA_ACCOUNT_KEY is not set. Add it in Vercel and redeploy.'
+    };
+    if (typeof res.status === 'function') {
+      return res.status(503).json(payload);
+    }
+    res.statusCode = 503;
+    return res.end(JSON.stringify(payload));
   }
 
+  // 2. Key is configured; perform a health check ping to LTA DataMall
+  const endpoint = 'https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=04121';
+
   try {
-    const response = await fetch(
-      'https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=04121',
-      {
-        method: 'GET',
-        headers: {
-          AccountKey: accountKey.trim(),
-        },
+    const upstreamRes = await fetch(endpoint, {
+      method: 'GET',
+      headers: {
+        AccountKey: apiKey,
+        accept: 'application/json'
       }
-    );
-
-    const upstreamStatus = response.status;
-
-    // Check response.ok before reading the body. LTA returns empty body on 401.
-    if (!response.ok) {
-      return res.status(upstreamStatus).json({
-        keyConfigured: true,
-        ltaAnswered: true,
-        upstreamStatus,
-        upstreamStatusCode: upstreamStatus,
-        error: `Upstream LTA responded with status ${upstreamStatus}: ${response.statusText || 'Error'}`,
-      });
-    }
-
-    return res.status(200).json({
-      keyConfigured: true,
-      ltaAnswered: true,
-      upstreamStatus,
-      upstreamStatusCode: upstreamStatus,
-      status: 'healthy',
     });
+
+    const isOk = upstreamRes.ok;
+    const statusCode = upstreamRes.status;
+
+    const payload = {
+      keyConfigured: true,
+      ltaAnswered: isOk,
+      upstreamStatus: statusCode,
+      message: isOk
+        ? 'LTA DataMall answered successfully'
+        : `LTA DataMall returned upstream status ${statusCode}`
+    };
+
+    const httpStatus = isOk ? 200 : statusCode;
+    if (typeof res.status === 'function') {
+      return res.status(httpStatus).json(payload);
+    }
+    res.statusCode = httpStatus;
+    return res.end(JSON.stringify(payload));
   } catch (err) {
-    return res.status(502).json({
+    const payload = {
       keyConfigured: true,
       ltaAnswered: false,
       upstreamStatus: null,
-      upstreamStatusCode: null,
-      error: `Failed to contact upstream LTA: ${err.message || 'Network error'}`,
-    });
+      error: `Network error pinging LTA DataMall: ${err.message || 'Connection failed'}`
+    };
+    if (typeof res.status === 'function') {
+      return res.status(502).json(payload);
+    }
+    res.statusCode = 502;
+    return res.end(JSON.stringify(payload));
   }
 }

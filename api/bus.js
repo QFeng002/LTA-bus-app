@@ -1,38 +1,58 @@
 /**
- * Bus arrival API handler
- * Vercel serverless function and Express route handler
- *
- * Accepts a BusStopCode query parameter, defaults to 04121.
- * Calls https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival
- * Returns a simplified list with ServiceNo and minutes until next two buses.
+ * Serverless function for LTA Singapore Bus Arrivals.
+ * Compatible with Vercel Serverless Functions and Express.
  */
-export default async function handler(req, res) {
-  const accountKey = process.env.LTA_ACCOUNT_KEY;
 
-  // BEFORE the fetch, if that variable is missing or empty, return 503
-  // and do not call LTA at all; never let an unset variable reach the header.
-  if (!accountKey || !accountKey.trim()) {
-    return res.status(503).json({
-      error: 'LTA_ACCOUNT_KEY is not set. Add it in Vercel and redeploy.',
-    });
+export default async function handler(req, res) {
+  // Support CORS and preflight if called externally
+  if (res.setHeader) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   }
 
-  // Accepts a BusStopCode query parameter, defaults to 04121
+  if (req.method === 'OPTIONS') {
+    if (typeof res.status === 'function') {
+      return res.status(204).end();
+    }
+    res.statusCode = 204;
+    return res.end();
+  }
+
+  // Set Cache-Control header: LTA refreshes every 20s
+  if (res.setHeader) {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 's-maxage=20, stale-while-revalidate=40');
+  }
+
+  // 1. Validate environment credential BEFORE any fetch
+  const apiKey = process.env.LTA_ACCOUNT_KEY;
+  if (!apiKey || apiKey.trim() === '') {
+    const errorBody = { error: 'LTA_ACCOUNT_KEY is not set. Add it in Vercel and redeploy.' };
+    if (typeof res.status === 'function') {
+      return res.status(503).json(errorBody);
+    }
+    res.statusCode = 503;
+    return res.end(JSON.stringify(errorBody));
+  }
+
+  // 2. Extract BusStopCode query parameter (defaults to 04121)
   let busStopCode = '04121';
-  if (req.query?.BusStopCode) {
-    busStopCode = req.query.BusStopCode;
-  } else if (req.query?.busStopCode) {
-    busStopCode = req.query.busStopCode;
-  } else if (req.url && req.url.includes('?')) {
+  if (req.query && (req.query.BusStopCode || req.query.busStopCode || req.query.busstopcode)) {
+    busStopCode = (req.query.BusStopCode || req.query.busStopCode || req.query.busstopcode).toString().trim();
+  } else if (req.url) {
     try {
       const parsedUrl = new URL(req.url, 'http://localhost');
-      busStopCode =
-        parsedUrl.searchParams.get('BusStopCode') ||
-        parsedUrl.searchParams.get('busStopCode') ||
-        '04121';
-    } catch {}
+      const param = parsedUrl.searchParams.get('BusStopCode') ||
+                    parsedUrl.searchParams.get('busStopCode') ||
+                    parsedUrl.searchParams.get('busstopcode');
+      if (param && param.trim()) {
+        busStopCode = param.trim();
+      }
+    } catch {
+      // Keep default
+    }
   }
-  busStopCode = busStopCode.toString().trim() || '04121';
 
   const endpoint = `https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=${encodeURIComponent(busStopCode)}`;
 
@@ -40,77 +60,84 @@ export default async function handler(req, res) {
     const response = await fetch(endpoint, {
       method: 'GET',
       headers: {
-        AccountKey: accountKey.trim(),
-      },
+        AccountKey: apiKey,
+        accept: 'application/json'
+      }
     });
 
-    // AFTER the fetch, check response.ok before reading the body.
-    // LTA returns an empty body on 401, so calling response.json() on a failed reply throws and crashes.
-    // On a non-2xx reply, return the upstream status and a one-line reason in your own JSON instead.
+    // AFTER fetch: check response.ok before reading body to avoid crash on empty error replies
     if (!response.ok) {
-      return res.status(response.status).json({
-        error: `Upstream LTA error: ${response.status} ${response.statusText || 'Request failed'}`.trim(),
-      });
+      const errorPayload = {
+        error: `LTA DataMall API error: upstream returned status ${response.status}`,
+        upstreamStatus: response.status
+      };
+      if (typeof res.status === 'function') {
+        return res.status(response.status).json(errorPayload);
+      }
+      res.statusCode = response.status;
+      return res.end(JSON.stringify(errorPayload));
     }
 
     const data = await response.json();
+    const rawServices = Array.isArray(data?.Services)
+      ? data.Services
+      : (Array.isArray(data?.services) ? data.services : []);
 
-    // Set Cache-Control: s-maxage=20, stale-while-revalidate=40
-    res.setHeader('Cache-Control', 's-maxage=20, stale-while-revalidate=40');
-
-    // Treat an empty Services array as "no buses running", not as an error.
-    const rawServices = Array.isArray(data?.Services) ? data.Services : [];
     const now = Date.now();
 
-    function getMinutes(bus) {
-      if (!bus || typeof bus !== 'object') return null;
-      const eta = bus.EstimatedArrival;
-      // LTA returns empty strings when there is no such bus: treat empty EstimatedArrival as no bus and omit it
-      if (!eta || typeof eta !== 'string' || eta.trim() === '') {
-        return null;
-      }
-      const time = new Date(eta).getTime();
-      if (isNaN(time)) {
-        return null;
-      }
-      const diffMs = time - now;
-      // Round down to whole minutes as LTA's guide asks
-      const diffMins = Math.floor(diffMs / 60000);
-      // Under one minute or arrived -> 0 (rendered as "Arriving" on screen)
-      return Math.max(0, diffMins);
-    }
+    // Map each service to ServiceNo and the minutes until each of the next two buses
+    const simplifiedServices = rawServices.map((service) => {
+      const serviceNo = String(service?.ServiceNo || service?.serviceNo || '').trim();
+      const nextBuses = [service?.NextBus, service?.NextBus2];
+      const arrivals = [];
 
-    const simplifiedList = rawServices.map((service) => {
-      const minutes = [];
-
-      const min1 = getMinutes(service.NextBus);
-      if (typeof min1 === 'number' && !isNaN(min1)) {
-        minutes.push(min1);
-      }
-
-      const min2 = getMinutes(service.NextBus2);
-      if (typeof min2 === 'number' && !isNaN(min2)) {
-        minutes.push(min2);
+      for (const bus of nextBuses) {
+        if (bus && typeof bus.EstimatedArrival === 'string') {
+          const etaStr = bus.EstimatedArrival.trim();
+          if (etaStr !== '') {
+            const etaTime = new Date(etaStr).getTime();
+            if (!isNaN(etaTime)) {
+              const diffMs = etaTime - now;
+              // Round down to whole minutes as LTA's guide asks
+              const diffMinutes = Math.floor(diffMs / 60000);
+              const validMinutes = Math.max(0, diffMinutes);
+              if (typeof validMinutes === 'number' && !isNaN(validMinutes)) {
+                arrivals.push(validMinutes);
+              }
+            }
+          }
+        }
       }
 
       return {
-        ServiceNo: service.ServiceNo,
-        minutes,
-        nextBuses: minutes,
+        ServiceNo: serviceNo,
+        arrivals,
+        nextBuses: arrivals,
+        ...(arrivals.length > 0 ? { nextBus: arrivals[0] } : {}),
+        ...(arrivals.length > 1 ? { nextBus2: arrivals[1] } : {})
       };
     });
 
-    if (req.query?.format === 'object') {
-      return res.status(200).json({
-        BusStopCode: busStopCode,
-        services: simplifiedList,
-      });
-    }
+    const result = {
+      BusStopCode: busStopCode,
+      services: simplifiedServices,
+      Services: simplifiedServices
+    };
 
-    return res.status(200).json(simplifiedList);
+    if (typeof res.status === 'function') {
+      return res.status(200).json(result);
+    }
+    res.statusCode = 200;
+    return res.end(JSON.stringify(result));
   } catch (err) {
-    return res.status(502).json({
-      error: `Failed to fetch from upstream LTA: ${err.message || 'Unknown error'}`,
-    });
+    const errorPayload = {
+      error: `Network error connecting to upstream service: ${err.message || 'Unknown error'}`,
+      upstreamStatus: null
+    };
+    if (typeof res.status === 'function') {
+      return res.status(502).json(errorPayload);
+    }
+    res.statusCode = 502;
+    return res.end(JSON.stringify(errorPayload));
   }
 }
