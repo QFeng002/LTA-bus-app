@@ -18,10 +18,21 @@ export default async function handler(req, res) {
   }
 
   // Accepts a BusStopCode query parameter, defaults to 04121
-  const busStopCode =
-    (req.query?.BusStopCode || req.query?.busStopCode || '04121')
-      .toString()
-      .trim() || '04121';
+  let busStopCode = '04121';
+  if (req.query?.BusStopCode) {
+    busStopCode = req.query.BusStopCode;
+  } else if (req.query?.busStopCode) {
+    busStopCode = req.query.busStopCode;
+  } else if (req.url && req.url.includes('?')) {
+    try {
+      const parsedUrl = new URL(req.url, 'http://localhost');
+      busStopCode =
+        parsedUrl.searchParams.get('BusStopCode') ||
+        parsedUrl.searchParams.get('busStopCode') ||
+        '04121';
+    } catch {}
+  }
+  busStopCode = busStopCode.toString().trim() || '04121';
 
   const endpoint = `https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=${encodeURIComponent(busStopCode)}`;
 
